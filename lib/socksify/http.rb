@@ -39,7 +39,7 @@ module Net
         # end
 
         def add(socks_host, socks_port, socks_version)
-          proxies << [socks_host, socks_port, socks_version]
+          proxies.unshift [socks_host, socks_port, socks_version]
         end
       end
 

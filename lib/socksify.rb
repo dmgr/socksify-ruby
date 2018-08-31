@@ -107,19 +107,21 @@ class TCPSocket
   end
 
   class SOCKSConnectionPeerAddress < String
-    attr_reader :socks_server, :socks_port, :socks_version
+    attr_reader :socks_server, :socks_port, :socks_version, :peer_host
 
     def initialize(socks_server, socks_port, socks_version, peer_host)
-      @socks_server, @socks_port, @socks_version = socks_server, socks_port, socks_version
+      @socks_server, @socks_port, @socks_version, @peer_host = socks_server, socks_port, socks_version, peer_host
       super peer_host
     end
 
     def inspect
-      "#{to_s} (via #{@socks_server}:#{@socks_port})"
+      "#{to_s} (#{proxy_chain})"
     end
 
-    def peer_host
-      to_s
+    def proxy_chain
+      chain = "via socks#{@socks_version}://#{@socks_server}:#{@socks_port}"
+      chain << ' ' << @peer_host.proxy_chain if @peer_host.is_a?(self.class)
+      chain
     end
   end
 
@@ -129,15 +131,17 @@ class TCPSocket
   def initialize(host=nil, port=0, local_host=nil, local_port=nil)
     if host.is_a?(SOCKSConnectionPeerAddress)
     # if socks_server and socks_port and not socks_ignores.include?(host)
-      Socksify::debug_notice "Connecting to SOCKS server #{host.socks_server}:#{host.socks_port}"
+      Socksify::debug_notice "Connecting to socks#{host.socks_version}://#{host.socks_server}:#{host.socks_port}"
       initialize_tcp(host.socks_server, host.socks_port)
       socks_authenticate if host.socks_version == '5'
+      socks_server = nil
 
-      while host.is_a?(SOCKSConnectionPeerAddress)
-        _port = host.peer_host.is_a?(SOCKSConnectionPeerAddress) ? host.peer_host.socks_port : port
-        socks_connect(host.peer_host, _port, host.socks_version)
-        host = host.peer_host
+      while host.peer_host.is_a?(SOCKSConnectionPeerAddress)
+        proxy = host.peer_host
+        socks_connect(proxy.socks_server, proxy.socks_port, host)
+        host = proxy
       end
+      socks_connect(host, port, host)
     else
       Socksify::debug_notice "Connecting directly to #{host}:#{port}"
       initialize_tcp(host, port, local_host, local_port)
@@ -183,8 +187,9 @@ class TCPSocket
     end
   end
 
-  def socks_connect(host, port, socks_version)
-    Socksify::debug_debug "Connecting to #{host}:#{port} via established connection..."
+  def socks_connect(host, port, socks_server)
+    socks_version = socks_server.socks_version
+    Socksify::debug_debug "Connecting to #{host}:#{port} via socks#{socks_version}://#{socks_server.socks_server}:#{socks_server.socks_port}..."
     port = Socket.getservbyname(port) if port.is_a?(String)
     req = String.new
     Socksify::debug_debug "Sending destination address"
@@ -223,7 +228,7 @@ class TCPSocket
     write req
 
     socks_receive_reply(socks_version)
-    Socksify::debug_notice "Connected to #{host}:#{port} over SOCKSv#{socks_version}"
+    Socksify::debug_notice "Connected to #{host}:#{port} via socks#{socks_version}://#{socks_server.socks_server}:#{socks_server.socks_port}"
   end
 
   # returns [bind_addr: String, bind_port: Fixnum]
