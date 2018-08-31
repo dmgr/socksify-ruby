@@ -19,6 +19,7 @@
 require 'socket'
 require 'resolv'
 require 'socksify/debug'
+require 'socksify/http'
 
 class SOCKSError < RuntimeError
   def initialize(msg)
@@ -92,26 +93,6 @@ class SOCKSError < RuntimeError
 end
 
 class TCPSocket
-  @@socks_version ||= "5"
-  
-  def self.socks_version
-    (@@socks_version == "4a" or @@socks_version == "4") ? "\004" : "\005"
-  end
-  def self.socks_version=(version)
-    @@socks_version = version.to_s
-  end
-  def self.socks_server
-    @@socks_server ||= nil
-  end
-  def self.socks_server=(host)
-    @@socks_server = host
-  end
-  def self.socks_port
-    @@socks_port ||= nil
-  end
-  def self.socks_port=(port)
-    @@socks_port = port
-  end
   def self.socks_username
     @@socks_username ||= nil
   end
@@ -124,18 +105,12 @@ class TCPSocket
   def self.socks_password=(password)
     @@socks_password = password
   end
-  def self.socks_ignores
-    @@socks_ignores ||= %w(localhost)
-  end
-  def self.socks_ignores=(ignores)
-    @@socks_ignores = ignores
-  end
 
   class SOCKSConnectionPeerAddress < String
-    attr_reader :socks_server, :socks_port
+    attr_reader :socks_server, :socks_port, :socks_version
 
-    def initialize(socks_server, socks_port, peer_host)
-      @socks_server, @socks_port = socks_server, socks_port
+    def initialize(socks_server, socks_port, socks_version, peer_host)
+      @socks_server, @socks_port, @socks_version = socks_server, socks_port, socks_version
       super peer_host
     end
 
@@ -148,34 +123,24 @@ class TCPSocket
     end
   end
 
-  alias :initialize_tcp :initialize
+  alias initialize_tcp initialize
 
   # See http://tools.ietf.org/html/rfc1928
   def initialize(host=nil, port=0, local_host=nil, local_port=nil)
     if host.is_a?(SOCKSConnectionPeerAddress)
-      socks_peer = host
-      socks_server = socks_peer.socks_server
-      socks_port = socks_peer.socks_port
-      socks_ignores = []
-      host = socks_peer.peer_host
-    else
-      socks_server = self.class.socks_server
-      socks_port = self.class.socks_port
-      socks_ignores = self.class.socks_ignores
-    end
+    # if socks_server and socks_port and not socks_ignores.include?(host)
+      Socksify::debug_notice "Connecting to SOCKS server #{host.socks_server}:#{host.socks_port}"
+      initialize_tcp(host.socks_server, host.socks_port)
+      socks_authenticate if host.socks_version == '5'
 
-    if socks_server and socks_port and not socks_ignores.include?(host)
-      Socksify::debug_notice "Connecting to SOCKS server #{socks_server}:#{socks_port}"
-      initialize_tcp socks_server, socks_port
-
-      socks_authenticate unless @@socks_version =~ /^4/
-
-      if host
-        socks_connect(host, port)
+      while host.is_a?(SOCKSConnectionPeerAddress)
+        _port = host.peer_host.is_a?(SOCKSConnectionPeerAddress) ? host.peer_host.socks_port : port
+        socks_connect(host.peer_host, _port, host.socks_version)
+        host = host.peer_host
       end
     else
       Socksify::debug_notice "Connecting directly to #{host}:#{port}"
-      initialize_tcp host, port, local_host, local_port
+      initialize_tcp(host, port, local_host, local_port)
       Socksify::debug_debug "Connected to #{host}:#{port}"
     end
   end
@@ -218,23 +183,22 @@ class TCPSocket
     end
   end
 
-  # Connect
-  def socks_connect(host, port)
+  def socks_connect(host, port, socks_version)
+    Socksify::debug_debug "Connecting to #{host}:#{port} via established connection..."
     port = Socket.getservbyname(port) if port.is_a?(String)
     req = String.new
     Socksify::debug_debug "Sending destination address"
-    req << TCPSocket.socks_version
-    Socksify::debug_debug TCPSocket.socks_version.unpack "H*"
+    req << (socks_version == '5' ? "\005" : "\004")
+    Socksify::debug_debug socks_version.unpack "H*"
     req << "\001"
-    req << "\000" if @@socks_version == "5"
-    req << [port].pack('n') if @@socks_version =~ /^4/
+    req << (socks_version == '5' ? "\000" : [port].pack('n'))
 
-    if @@socks_version == "4"
+    if socks_version == "4"
+      Socksify::debug_debug "DNS leak!"
       host = Resolv::DNS.new.getaddress(host).to_s
     end
-    Socksify::debug_debug host
     if host =~ /^(\d+)\.(\d+)\.(\d+)\.(\d+)$/  # to IPv4 address
-      req << "\001" if @@socks_version == "5"
+      req << "\001" if socks_version == '5'
       _ip = [$1.to_i,
              $2.to_i,
              $3.to_i,
@@ -244,28 +208,28 @@ class TCPSocket
     elsif host =~ /^[:0-9a-f]+$/  # to IPv6 address
       raise "TCP/IPv6 over SOCKS is not yet supported (inet_pton missing in Ruby & not supported by Tor"
       req << "\004"
-    else                          # to hostname
-      if @@socks_version == "5"
-        req << "\003" + [host.size].pack('C') + host
+    else
+      Socksify::debug_notice "Resolving #{host} via SOCKS"
+      if socks_version == '5'
+        req << "\003" << [host.size].pack('C') << host
       else
         req << "\000\000\000\001"
         req << "\007\000"
-        Socksify::debug_notice host
         req << host
         req << "\000"
       end
     end
-    req << [port].pack('n') if @@socks_version == "5"
+    req << (socks_version == '5' ? [port].pack('n') : "\000")
     write req
 
-    socks_receive_reply
-    Socksify::debug_notice "Connected to #{host}:#{port} over SOCKS"
+    socks_receive_reply(socks_version)
+    Socksify::debug_notice "Connected to #{host}:#{port} over SOCKSv#{socks_version}"
   end
 
   # returns [bind_addr: String, bind_port: Fixnum]
-  def socks_receive_reply
+  def socks_receive_reply(socks_version)
     Socksify::debug_debug "Waiting for SOCKS reply"
-    if @@socks_version == "5"
+    if socks_version == '5'
       connect_reply = recv(4)
       if connect_reply.empty?
         raise SOCKSError.new("Server doesn't reply")
@@ -294,7 +258,7 @@ class TCPSocket
                     bind_addr_s.bytes.to_a.join('.')
                   when "\003"
                     bind_addr_s
-                  when "\004"  # Untested!
+                  when "\004" # Untested!
                     i = 0
                     ip6 = ""
                     bind_addr_s.each_byte do |b|
@@ -340,7 +304,7 @@ module Socksify
       end
       req << [0].pack('n')  # Port
       s.write req
-      
+
       addr, _port = s.socks_receive_reply
       Socksify::debug_notice "Resolved #{host} as #{addr} over SOCKS"
       addr
@@ -349,16 +313,16 @@ module Socksify
     end
   end
 
-  def self.proxy(server, port)
-    default_server = TCPSocket::socks_server
-    default_port = TCPSocket::socks_port
-    begin
-      TCPSocket::socks_server = server
-      TCPSocket::socks_port = port
-      yield
-    ensure
-      TCPSocket::socks_server = default_server
-      TCPSocket::socks_port = default_port
-    end
-  end
+  # def self.proxy(server, port)
+  #   default_server = TCPSocket::socks_server
+  #   default_port = TCPSocket::socks_port
+  #   begin
+  #     TCPSocket::socks_server = server
+  #     TCPSocket::socks_port = port
+  #     yield
+  #   ensure
+  #     TCPSocket::socks_server = default_server
+  #     TCPSocket::socks_port = default_port
+  #   end
+  # end
 end
