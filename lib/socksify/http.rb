@@ -19,44 +19,41 @@
 require 'socksify'
 require 'net/http'
 
-module Net
-  class HTTP
-    def self.SocksProxy
+class << Net::HTTP
+  alias_method :HttpProxy, :Proxy
+
+  def Proxy(*args)
+    case uri = args[0]
+    when Socksify::URI::InstanceMethods
       Class.new(self) do
-        include SOCKSProxyDelta::InstanceMethods
-        extend  SOCKSProxyDelta::ClassMethods
-        # class << self
-          @proxies = []
-        # end
+        extend  SocksProxyClassMethods
+        include SocksProxyInstanceMethods
+        @proxy = uri
       end
+    when URI
+      if Socksify::URI::SOCKS_SCHEMES[uri.scheme]
+        uri.dup.singleton_class.send(:include, Socksify::URI::InstanceMethods)
+        Proxy(uri)
+      else
+        HttpProxy(uri.host, uri.port, uri.user, uri.password)
+      end
+    else
+      HttpProxy(*args)
     end
+  end
 
-    module SOCKSProxyDelta
-      module ClassMethods
-        attr_reader :proxies
-        # def proxies
-        #   @proxies
-        # end
+  module SocksProxyClassMethods
+    attr_reader :proxy
+  end
 
-        def add(socks_host, socks_port, socks_version)
-          proxies.unshift [socks_host, socks_port, socks_version]
-        end
+  module SocksProxyInstanceMethods
+    if RUBY_VERSION[0..0] >= '2'
+      def address
+        Socksify::Host.new(@address, self.class.proxy)
       end
-
-      module InstanceMethods
-        if RUBY_VERSION[0..0] >= '2'
-          def address
-            self.class.proxies.reduce(@address) do |result, proxy|
-              TCPSocket::SOCKSConnectionPeerAddress.new(*proxy, result)
-            end
-          end
-        else
-          def conn_address
-            self.class.proxies.reduce(address) do |result, proxy|
-              TCPSocket::SOCKSConnectionPeerAddress.new(*proxy, result)
-            end
-          end
-        end
+    else
+      def conn_address
+        Socksify::Host.new(address, self.class.proxy)
       end
     end
   end

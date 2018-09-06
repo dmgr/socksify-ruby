@@ -1,25 +1,25 @@
-#encoding: us-ascii
+# frozen_string_literal: true
+# encoding: us-ascii
 =begin
-    Copyright (C) 2007 Stephan Maka <stephan@spaceboyz.net>
+  Copyright (C) 2007 Stephan Maka <stephan@spaceboyz.net>
 
-    This program is free software: you can redistribute it and/or modify
-    it under the terms of the GNU General Public License as published by
-    the Free Software Foundation, either version 3 of the License, or
-    (at your option) any later version.
+  This program is free software: you can redistribute it and/or modify
+  it under the terms of the GNU General Public License as published by
+  the Free Software Foundation, either version 3 of the License, or
+  (at your option) any later version.
 
-    This program is distributed in the hope that it will be useful,
-    but WITHOUT ANY WARRANTY; without even the implied warranty of
-    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-    GNU General Public License for more details.
+  This program is distributed in the hope that it will be useful,
+  but WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+  GNU General Public License for more details.
 
-    You should have received a copy of the GNU General Public License
-    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+  You should have received a copy of the GNU General Public License
+  along with this program.  If not, see <http://www.gnu.org/licenses/>.
 =end
 
 require 'socket'
 require 'resolv'
 require 'socksify/debug'
-require 'socksify/http'
 
 class SOCKSError < RuntimeError
   def initialize(msg)
@@ -92,53 +92,77 @@ class SOCKSError < RuntimeError
   end
 end
 
-class TCPSocket
-  def self.socks_username
-    @@socks_username ||= nil
-  end
-  def self.socks_username=(username)
-    @@socks_username = username
-  end
-  def self.socks_password
-    @@socks_password ||= nil
-  end
-  def self.socks_password=(password)
-    @@socks_password = password
+module Socksify
+  class URI < URI::Generic
+    SOCKS_SCHEMES = {
+      'socks'  => '5',
+      'socks4' => '4',
+      'socks5' => '5'
+    }
+
+    module InstanceMethods
+      attr_writer :version
+
+      def version
+        @version || SOCKS_SCHEMES[scheme] || '5'
+      end
+    end
+
+    module ClassMethods
+      def build(args)
+        uri = super
+        uri.scheme = "socks#{uri.version}"
+        uri
+      end
+    end
+
+    include InstanceMethods
+    extend  ClassMethods
   end
 
-  class SOCKSConnectionPeerAddress < String
-    attr_reader :socks_server, :socks_port, :socks_version, :peer_host
+  class Host < String
+    attr_reader :socks, :destination_host
 
-    def initialize(socks_server, socks_port, socks_version, peer_host)
-      @socks_server, @socks_port, @socks_version, @peer_host = socks_server, socks_port, socks_version, peer_host
-      super peer_host
+    def initialize(host, *socks_args)
+      super @destination_host = host
+      @socks =
+        case socks_args[0]
+        when URI
+          socks_args[0]
+        else
+          URI.build host: socks_args[0], port: socks_args[1], version: socks_args[2]
+        end
     end
 
     def inspect
-      "#{to_s} (#{proxy_chain})"
+      "#{self} (via #{proxy_chain.join ' via '})"
     end
 
     def proxy_chain
-      chain = "via socks#{@socks_version}://#{@socks_server}:#{@socks_port}"
-      chain << ' ' << @peer_host.proxy_chain if @peer_host.is_a?(self.class)
-      chain
+      if @destination_host.is_a?(Host)
+        @destination_host.proxy_chain
+      else
+        []
+      end.unshift(socks)
     end
   end
+end
 
+class TCPSocket
   alias initialize_tcp initialize
 
   # See http://tools.ietf.org/html/rfc1928
   def initialize(host=nil, port=0, local_host=nil, local_port=nil)
-    if host.is_a?(SOCKSConnectionPeerAddress)
+    if host.is_a?(Socksify::Host)
     # if socks_server and socks_port and not socks_ignores.include?(host)
-      Socksify::debug_notice "Connecting to socks#{host.socks_version}://#{host.socks_server}:#{host.socks_port}"
-      initialize_tcp(host.socks_server, host.socks_port)
-      socks_authenticate if host.socks_version == '5'
+      Socksify::debug_notice "Connecting to socks#{host.socks.version}://#{host.socks.host}:#{host.socks.port}"
+      initialize_tcp(host.socks.host, host.socks.port)
+      socks_authenticate(host.socks) if host.socks.version == '5'
       socks_server = nil
 
-      while host.peer_host.is_a?(SOCKSConnectionPeerAddress)
-        proxy = host.peer_host
-        socks_connect(proxy.socks_server, proxy.socks_port, host)
+      while host.destination_host.is_a?(Socksify::Host)
+        proxy = host.destination_host
+        socks_connect(proxy.socks.host, proxy.socks.port, host)
         host = proxy
       end
       socks_connect(host, port, host)
@@ -150,8 +174,8 @@ class TCPSocket
   end
 
   # Authentication
-  def socks_authenticate
-    if self.class.socks_username || self.class.socks_password
+  def socks_authenticate(socks)
+    if socks.user || socks.password
       Socksify::debug_debug "Sending username/password authentication"
       write "\005\001\002"
     else
@@ -166,15 +190,15 @@ class TCPSocket
     if auth_reply[0..0] != "\004" and auth_reply[0..0] != "\005"
       raise SOCKSError.new("SOCKS version #{auth_reply[0..0]} not supported")
     end
-    if self.class.socks_username || self.class.socks_password
+    if socks.user || socks.password
       if auth_reply[1..1] != "\002"
         raise SOCKSError.new("SOCKS authentication method #{auth_reply[1..1]} neither requested nor supported")
       end
       auth = "\001"
-      auth += self.class.socks_username.to_s.length.chr
-      auth += self.class.socks_username.to_s
-      auth += self.class.socks_password.to_s.length.chr
-      auth += self.class.socks_password.to_s
+      auth += socks.user.to_s.length.chr
+      auth += socks.user.to_s
+      auth += socks.password.to_s.length.chr
+      auth += socks.password.to_s
       write auth
       auth_reply = recv(2)
       if auth_reply[1..1] != "\000"
@@ -188,8 +212,8 @@ class TCPSocket
   end
 
   def socks_connect(host, port, socks_server)
-    socks_version = socks_server.socks_version
-    Socksify::debug_debug "Connecting to #{host}:#{port} via socks#{socks_version}://#{socks_server.socks_server}:#{socks_server.socks_port}..."
+    socks_version = socks_server.socks.version
+    Socksify::debug_debug "Connecting to #{host}:#{port} via socks#{socks_version}://#{socks_server.socks.host}:#{socks_server.socks.port}..."
     port = Socket.getservbyname(port) if port.is_a?(String)
     req = String.new
     Socksify::debug_debug "Sending destination address"
@@ -228,7 +252,7 @@ class TCPSocket
     write req
 
     socks_receive_reply(socks_version)
-    Socksify::debug_notice "Connected to #{host}:#{port} via socks#{socks_version}://#{socks_server.socks_server}:#{socks_server.socks_port}"
+    Socksify::debug_notice "Connected to #{host}:#{port} via socks#{socks_version}://#{socks_server.socks.host}:#{socks_server.socks.port}"
   end
 
   # returns [bind_addr: String, bind_port: Fixnum]
